@@ -22,6 +22,7 @@ use loader::importer::BootPageAcceptance;
 use loader::importer::GuestArch;
 use loader::importer::ImageLoad;
 use loader::importer::StartupMemoryType;
+use loader::importer::SegmentRegister;
 use loader::importer::TableRegister;
 use loader::importer::X86Register;
 use memory_range::MemoryRange;
@@ -88,14 +89,20 @@ pub enum Error {
     Vtl2MemoryTooSmall(u64, u64),
     #[error("unsupported guest architecture")]
     UnsupportedGuestArch,
-    #[error("igvm file does not support vbs")]
-    NoVbsSupport,
+    #[error("igvm file does not contain a supported platform (NATIVE or VBS)")]
+    NoPlatformSupport,
     #[error("vp context for lower VTL not supported")]
     LowerVtlContext,
     #[error("missing required memory range {0}")]
     MissingRequiredMemory(MemoryRange),
     #[error("IGVM file requires at least two mmio ranges")]
     UnsupportedMmio,
+    #[error("failed to write e820 map to zero page")]
+    WriteE820(#[source] guestmem::GuestMemoryError),
+    #[error("too many RAM ranges for e820 table ({0}, max 128)")]
+    TooManyE820Entries(usize),
+    #[error("failed to write ACPI tables to guest memory")]
+    WriteAcpi(#[source] guestmem::GuestMemoryError),
 }
 
 fn from_memory_range(range: &MemoryRange) -> IGVM_VHS_MEMORY_RANGE {
@@ -125,36 +132,58 @@ fn from_igvm_vtl(vtl: igvm::hv_defs::Vtl) -> hvdef::Vtl {
     }
 }
 
-/// Read and parse an IgvmFile from a File. This assumes the file is a VBS IGVM
-/// file.
+/// Read and parse an IgvmFile from a File. Accepts both NATIVE and VBS
+/// platform types.
 pub fn read_igvm_file(mut file: &std::fs::File) -> Result<IgvmFile, Error> {
     let mut file_contents = Vec::new();
     file.rewind().map_err(Error::Igvm)?;
     file.read_to_end(&mut file_contents).map_err(Error::Igvm)?;
 
-    let igvm_file = IgvmFile::new_from_binary(&file_contents, Some(igvm::IsolationType::Vbs))
+    // Try parsing without a platform filter so both NATIVE and VBS files are
+    // accepted.
+    let igvm_file = IgvmFile::new_from_binary(&file_contents, None)
         .map_err(Error::InvalidIgvmFile)?;
+
+    // Verify the file contains at least one supported platform type.
+    if platform_header(&igvm_file).is_err() {
+        return Err(Error::NoPlatformSupport);
+    }
 
     Ok(igvm_file)
 }
 
-/// Extract the vbs supported platform header from an igvm file.
-fn vbs_platform_header(igvm_file: &IgvmFile) -> Result<&IgvmPlatformHeader, Error> {
+/// Returns true if the preferred platform type for this IGVM file is NATIVE.
+pub fn is_native_platform(igvm_file: &IgvmFile) -> bool {
+    igvm_file.platforms().iter().any(|header| {
+        let IgvmPlatformHeader::SupportedPlatform(info) = header;
+        info.platform_type == IgvmPlatformType::NATIVE
+    })
+}
+
+/// Extract the supported platform header from an igvm file. Prefers NATIVE,
+/// falls back to VSM_ISOLATION.
+fn platform_header(igvm_file: &IgvmFile) -> Result<&IgvmPlatformHeader, Error> {
     igvm_file
         .platforms()
         .iter()
         .find(|header| {
             let IgvmPlatformHeader::SupportedPlatform(info) = header;
-            info.platform_type == IgvmPlatformType::VSM_ISOLATION
+            info.platform_type == IgvmPlatformType::NATIVE
         })
-        .ok_or(Error::NoVbsSupport)
+        .or_else(|| {
+            igvm_file.platforms().iter().find(|header| {
+                let IgvmPlatformHeader::SupportedPlatform(info) = header;
+                info.platform_type == IgvmPlatformType::VSM_ISOLATION
+            })
+        })
+        .ok_or(Error::NoPlatformSupport)
 }
 
 /// Determine if the given `igvm_file` supports relocations or not.
 pub fn supports_relocations(igvm_file: &IgvmFile) -> bool {
-    let (mask, _max_vtl) = match vbs_platform_header(igvm_file).unwrap() {
+    let (mask, _max_vtl) = match platform_header(igvm_file).unwrap() {
         IgvmPlatformHeader::SupportedPlatform(info) => {
-            debug_assert_eq!(info.platform_type, IgvmPlatformType::VSM_ISOLATION);
+
             (info.compatibility_mask, info.highest_vtl)
         }
     };
@@ -166,9 +195,9 @@ pub fn supports_relocations(igvm_file: &IgvmFile) -> bool {
 /// [`IgvmDirectiveHeader::RequiredMemory`] structure is looked for, with the
 /// flag set for vtl2_protectable.
 pub fn vtl2_memory_info(igvm_file: &IgvmFile) -> Result<MemoryRange, Error> {
-    let (mask, _max_vtl) = match vbs_platform_header(igvm_file)? {
+    let (mask, _max_vtl) = match platform_header(igvm_file)? {
         IgvmPlatformHeader::SupportedPlatform(info) => {
-            debug_assert_eq!(info.platform_type, IgvmPlatformType::VSM_ISOLATION);
+
             (info.compatibility_mask, info.highest_vtl)
         }
     };
@@ -210,9 +239,9 @@ pub fn vtl2_memory_range(
     igvm_file: &IgvmFile,
     vtl2_size: Option<u64>,
 ) -> Result<MemoryRange, Error> {
-    let (mask, _max_vtl) = match vbs_platform_header(igvm_file)? {
+    let (mask, _max_vtl) = match platform_header(igvm_file)? {
         IgvmPlatformHeader::SupportedPlatform(info) => {
-            debug_assert_eq!(info.platform_type, IgvmPlatformType::VSM_ISOLATION);
+
             (info.compatibility_mask, info.highest_vtl)
         }
     };
@@ -610,9 +639,9 @@ fn load_igvm_x86(
 
     let command_line = CString::new(cmdline).map_err(Error::InvalidCommandLine)?;
 
-    let (mask, max_vtl) = match vbs_platform_header(igvm_file)? {
+    let (mask, max_vtl) = match platform_header(igvm_file)? {
         IgvmPlatformHeader::SupportedPlatform(info) => {
-            debug_assert_eq!(info.platform_type, IgvmPlatformType::VSM_ISOLATION);
+
             (info.compatibility_mask, info.highest_vtl)
         }
     };
@@ -821,6 +850,7 @@ fn load_igvm_x86(
     vtl2_protectable_ram.sort_by_key(|r| r.start());
 
     let mut page_table_cpu_state: Option<CpuPagingState> = None;
+    let mut native_zero_page_gpa: Option<u64> = None;
 
     // If requested, filter to VTL2-related directives only.
     let pt_range = page_table_fixup.as_ref().map_or(MemoryRange::EMPTY, |x| {
@@ -861,9 +891,9 @@ fn load_igvm_x86(
                 | IgvmDirectiveHeader::VbsMeasurement { .. }
                 | IgvmDirectiveHeader::DeviceTree { .. }
                 | IgvmDirectiveHeader::EnvironmentInfo { .. } => true,
-                IgvmDirectiveHeader::X64NativeVpContext { .. } => {
-                    todo!("native igvm type not supported yet")
-                }
+                // Native VP context has no VTL field — it always targets the
+                // highest VTL in the file, so include it unconditionally.
+                IgvmDirectiveHeader::X64NativeVpContext { .. } => true,
             }
         } else {
             panic!("no relocation region, cannot filter to VTL2");
@@ -1197,13 +1227,198 @@ fn load_igvm_x86(
             IgvmDirectiveHeader::ErrorRange { .. } => {
                 todo!("Error Range not supported")
             }
-            IgvmDirectiveHeader::X64NativeVpContext { .. } => {
-                todo!("native vp context not supported")
+            IgvmDirectiveHeader::X64NativeVpContext {
+                compatibility_mask: _,
+                vp_index: _,
+                ref context,
+            } => {
+                // Track the zero page GPA (RSI) for e820 post-processing.
+                native_zero_page_gpa = Some(context.rsi);
+
+                let code_seg = SegmentRegister {
+                    selector: context.code_selector,
+                    base: context.code_base as u64,
+                    limit: context.code_limit,
+                    attributes: context.code_attributes,
+                };
+                let data_seg = SegmentRegister {
+                    selector: context.data_selector,
+                    base: context.data_base as u64,
+                    limit: context.data_limit,
+                    attributes: context.data_attributes,
+                };
+
+                let native_regs = [
+                    X86Register::Cr0(context.cr0),
+                    X86Register::Cr3(context.cr3),
+                    X86Register::Cr4(context.cr4),
+                    X86Register::Efer(context.efer),
+                    X86Register::Rip(context.rip),
+                    X86Register::Rflags(context.rflags),
+                    X86Register::Rsi(context.rsi),
+                    X86Register::Rsp(context.rsp),
+                    X86Register::Rbp(context.rbp),
+                    X86Register::R8(context.r8),
+                    X86Register::R9(context.r9),
+                    X86Register::R10(context.r10),
+                    X86Register::R11(context.r11),
+                    X86Register::R12(context.r12),
+                    X86Register::Gdtr(TableRegister {
+                        base: context.gdtr_base,
+                        limit: context.gdtr_limit,
+                    }),
+                    X86Register::Idtr(TableRegister {
+                        base: context.idtr_base,
+                        limit: context.idtr_limit,
+                    }),
+                    X86Register::Cs(code_seg),
+                    X86Register::Ds(data_seg),
+                    X86Register::Es(data_seg),
+                    X86Register::Fs(data_seg),
+                    X86Register::Gs(data_seg),
+                    X86Register::Ss(data_seg),
+                ];
+
+                for reg in native_regs {
+                    loader
+                        .import_vp_register(reg)
+                        .map_err(Error::Loader)?;
+                }
             }
         }
     }
 
     page_data.flush(&mut loader)?;
+
+    // For native IGVM files, write e820 entries into the Linux zero page.
+    // The IGVM MemoryMap parameter populates a separate GPA range, but
+    // Linux reads the e820 table from boot_params in the zero page.
+    if let Some(zero_page_gpa) = native_zero_page_gpa {
+        let e820_count = all_ram.len();
+        if e820_count > 128 {
+            return Err(Error::TooManyE820Entries(e820_count));
+        }
+
+        // Write e820_entries count.
+        let e820_entries_offset = std::mem::offset_of!(loader_defs::linux::boot_params, e820_entries);
+        gm.write_at(
+            zero_page_gpa + e820_entries_offset as u64,
+            &[e820_count as u8],
+        )
+        .map_err(Error::WriteE820)?;
+
+        // Write e820 map entries.
+        let e820_map_offset = std::mem::offset_of!(loader_defs::linux::boot_params, e820_map);
+        for (i, ram) in all_ram.iter().enumerate() {
+            let entry = loader_defs::linux::e820entry {
+                addr: (ram.range.start()).into(),
+                size: (ram.range.len()).into(),
+                typ: loader_defs::linux::E820_RAM.into(),
+            };
+            let entry_offset = e820_map_offset + i * size_of::<loader_defs::linux::e820entry>();
+            gm.write_at(
+                zero_page_gpa + entry_offset as u64,
+                IntoBytes::as_bytes(&entry),
+            )
+            .map_err(Error::WriteE820)?;
+        }
+
+        tracing::info!(
+            zero_page_gpa,
+            e820_count,
+            "wrote e820 entries to zero page for native IGVM"
+        );
+
+        // Build minimal ACPI tables (RSDP + XSDT + MADT + SRAT) and write
+        // them to guest memory so the kernel can discover the APIC
+        // configuration and enable SMP.
+        //
+        // Place the RSDP at GPA 0x14000 and tables at 0x15000. These
+        // addresses are within low RAM and don't conflict with the IGVM
+        // parameter areas (which end at 0x13FFF).
+        const ACPI_RSDP_GPA: u64 = 0x14000;
+        const ACPI_TABLES_GPA: u64 = 0x15000;
+
+        let oem_info = acpi::builder::OemInfo {
+            oem_id: *b"OPNVMM",
+            oem_tableid: *b"OPENVMM ",
+            oem_revision: 1,
+            creator_id: *b"OVMM",
+            creator_revision: 1,
+        };
+
+        let mut builder = acpi::builder::Builder::new(ACPI_TABLES_GPA, oem_info);
+
+        // Build a DSDT with PCI host bridge so the guest can discover
+        // PCI devices (e.g. virtio-pci).
+        let mut dsdt = acpi::dsdt::Dsdt::new();
+        let mmio = mem_layout.mmio();
+        if mmio.len() >= 2 {
+            // PCI INT#A is wired to IRQ 11 (with PIC) or IRQ 16 (without).
+            // Pre-populate routing entries for PCI device slots 10..16 which
+            // is where virtio-pci devices get assigned.
+            let pci_irq: u32 = 11;
+            let pci_interrupts: Vec<((u8, Option<u8>), u32)> = (10..16u8)
+                .map(|dev| ((dev, None), pci_irq))
+                .collect();
+            dsdt.add_pci(mmio[0], mmio[1], &pci_interrupts);
+        }
+        let dsdt_bytes = dsdt.to_bytes();
+        let dsdt_addr = builder.append_raw(&dsdt_bytes);
+
+        builder.append(&acpi::builder::Table::new(
+            6,
+            None,
+            &acpi_spec::fadt::Fadt {
+                flags: acpi_spec::fadt::FADT_HW_REDUCED_ACPI,
+                x_dsdt: dsdt_addr,
+                p_lvl2_lat: 101,  // disable C2
+                p_lvl3_lat: 1001, // disable C3
+                ..Default::default()
+            },
+        ));
+
+        // Append the MADT (already a complete ACPI table with header).
+        builder.append_raw(acpi_tables.madt);
+
+        // Append the SRAT.
+        builder.append_raw(acpi_tables.srat);
+
+        // Append SLIT and PPTT if provided.
+        if let Some(slit) = acpi_tables.slit {
+            builder.append_raw(slit);
+        }
+        if let Some(pptt) = acpi_tables.pptt {
+            builder.append_raw(pptt);
+        }
+
+        let (rsdp_bytes, tables_bytes) = builder.build();
+
+        // Write RSDP to guest memory.
+        gm.write_at(ACPI_RSDP_GPA, &rsdp_bytes)
+            .map_err(Error::WriteAcpi)?;
+
+        // Write XSDT + tables to guest memory.
+        gm.write_at(ACPI_TABLES_GPA, &tables_bytes)
+            .map_err(Error::WriteAcpi)?;
+
+        // Write the RSDP physical address into the zero page at offset
+        // 0x070 (boot_params.acpi_rsdp_addr). This field isn't in the
+        // openvmm boot_params struct but is defined in the Linux kernel
+        // for boot protocol version >= 2.14.
+        const ACPI_RSDP_ADDR_OFFSET: u64 = 0x070;
+        gm.write_at(
+            zero_page_gpa + ACPI_RSDP_ADDR_OFFSET,
+            IntoBytes::as_bytes(&ACPI_RSDP_GPA),
+        )
+        .map_err(Error::WriteAcpi)?;
+
+        tracing::info!(
+            ACPI_RSDP_GPA,
+            ACPI_TABLES_GPA,
+            "wrote ACPI tables to guest memory for native IGVM"
+        );
+    }
 
     // Apply page table relocations after all headers have been scanned.
     if let Some(offset) = relocation_offset {
