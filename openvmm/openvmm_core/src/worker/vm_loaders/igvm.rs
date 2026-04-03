@@ -550,6 +550,9 @@ pub struct AcpiTables<'a> {
     pub srat: &'a [u8],
     pub slit: Option<&'a [u8]>,
     pub pptt: Option<&'a [u8]>,
+    /// Pre-built DSDT for native IGVM guests. Built by the dispatch
+    /// layer which knows the chipset config and PCI device assignments.
+    pub dsdt: Option<&'a [u8]>,
 }
 
 /// The parameters to the [`load_igvm`] function.
@@ -851,6 +854,9 @@ fn load_igvm_x86(
 
     let mut page_table_cpu_state: Option<CpuPagingState> = None;
     let mut native_zero_page_gpa: Option<u64> = None;
+    // Track the highest GPA used by IGVM parameter inserts so we can
+    // place ACPI tables right after without hardcoding addresses.
+    let mut max_parameter_end_gpa: u64 = 0;
 
     // If requested, filter to VTL2-related directives only.
     let pt_range = page_table_fixup.as_ref().map_or(MemoryRange::EMPTY, |x| {
@@ -1212,15 +1218,21 @@ fn load_igvm_x86(
                     .get_mut(&parameter_area_index)
                     .expect("igvmfile should be valid");
                 match std::mem::replace(area, ParameterAreaState::Inserted) {
-                    ParameterAreaState::Allocated { data, max_size } => loader
-                        .import_pages(
-                            gpa / HV_PAGE_SIZE,
-                            max_size / HV_PAGE_SIZE,
-                            "igvm-parameter",
-                            BootPageAcceptance::ExclusiveUnmeasured,
-                            &data,
-                        )
-                        .map_err(Error::Loader)?,
+                    ParameterAreaState::Allocated { data, max_size } => {
+                        let end_gpa = gpa + max_size;
+                        if end_gpa > max_parameter_end_gpa {
+                            max_parameter_end_gpa = end_gpa;
+                        }
+                        loader
+                            .import_pages(
+                                gpa / HV_PAGE_SIZE,
+                                max_size / HV_PAGE_SIZE,
+                                "igvm-parameter",
+                                BootPageAcceptance::ExclusiveUnmeasured,
+                                &data,
+                            )
+                            .map_err(Error::Loader)?
+                    }
                     ParameterAreaState::Inserted => panic!("igvmfile is invalid, multiple insert"),
                 }
             }
@@ -1329,15 +1341,12 @@ fn load_igvm_x86(
             "wrote e820 entries to zero page for native IGVM"
         );
 
-        // Build minimal ACPI tables (RSDP + XSDT + MADT + SRAT) and write
-        // them to guest memory so the kernel can discover the APIC
-        // configuration and enable SMP.
-        //
-        // Place the RSDP at GPA 0x14000 and tables at 0x15000. These
-        // addresses are within low RAM and don't conflict with the IGVM
-        // parameter areas (which end at 0x13FFF).
-        const ACPI_RSDP_GPA: u64 = 0x14000;
-        const ACPI_TABLES_GPA: u64 = 0x15000;
+        // Build ACPI tables (RSDP + XSDT + FADT + DSDT + MADT + SRAT)
+        // and write them to guest memory. Place them right after the
+        // last IGVM parameter area so addresses are determined
+        // dynamically from the IGVM file layout.
+        let acpi_rsdp_gpa = (max_parameter_end_gpa + HV_PAGE_SIZE - 1) & !(HV_PAGE_SIZE - 1);
+        let acpi_tables_gpa = acpi_rsdp_gpa + HV_PAGE_SIZE;
 
         let oem_info = acpi::builder::OemInfo {
             oem_id: *b"OPNVMM",
@@ -1347,24 +1356,19 @@ fn load_igvm_x86(
             creator_revision: 1,
         };
 
-        let mut builder = acpi::builder::Builder::new(ACPI_TABLES_GPA, oem_info);
+        let mut builder = acpi::builder::Builder::new(acpi_tables_gpa, oem_info);
 
-        // Build a DSDT with PCI host bridge so the guest can discover
-        // PCI devices (e.g. virtio-pci).
-        let mut dsdt = acpi::dsdt::Dsdt::new();
-        let mmio = mem_layout.mmio();
-        if mmio.len() >= 2 {
-            // PCI INT#A is wired to IRQ 11 (with PIC) or IRQ 16 (without).
-            // Pre-populate routing entries for PCI device slots 10..16 which
-            // is where virtio-pci devices get assigned.
-            let pci_irq: u32 = 11;
-            let pci_interrupts: Vec<((u8, Option<u8>), u32)> = (10..16u8)
-                .map(|dev| ((dev, None), pci_irq))
-                .collect();
-            dsdt.add_pci(mmio[0], mmio[1], &pci_interrupts);
-        }
-        let dsdt_bytes = dsdt.to_bytes();
-        let dsdt_addr = builder.append_raw(&dsdt_bytes);
+        // Use the pre-built DSDT from the dispatch layer (which knows
+        // the chipset config and PCI device assignments), or fall back
+        // to an empty DSDT.
+        let default_dsdt;
+        let dsdt_bytes = if let Some(dsdt) = acpi_tables.dsdt {
+            dsdt
+        } else {
+            default_dsdt = acpi::dsdt::Dsdt::new().to_bytes();
+            &default_dsdt
+        };
+        let dsdt_addr = builder.append_raw(dsdt_bytes);
 
         builder.append(&acpi::builder::Table::new(
             6,
@@ -1395,27 +1399,26 @@ fn load_igvm_x86(
         let (rsdp_bytes, tables_bytes) = builder.build();
 
         // Write RSDP to guest memory.
-        gm.write_at(ACPI_RSDP_GPA, &rsdp_bytes)
+        gm.write_at(acpi_rsdp_gpa, &rsdp_bytes)
             .map_err(Error::WriteAcpi)?;
 
         // Write XSDT + tables to guest memory.
-        gm.write_at(ACPI_TABLES_GPA, &tables_bytes)
+        gm.write_at(acpi_tables_gpa, &tables_bytes)
             .map_err(Error::WriteAcpi)?;
 
-        // Write the RSDP physical address into the zero page at offset
-        // 0x070 (boot_params.acpi_rsdp_addr). This field isn't in the
-        // openvmm boot_params struct but is defined in the Linux kernel
-        // for boot protocol version >= 2.14.
-        const ACPI_RSDP_ADDR_OFFSET: u64 = 0x070;
+        // Write the RSDP physical address into boot_params.acpi_rsdp_addr
+        // so the kernel can find the ACPI tables.
+        let acpi_rsdp_addr_offset =
+            std::mem::offset_of!(loader_defs::linux::boot_params, acpi_rsdp_addr);
         gm.write_at(
-            zero_page_gpa + ACPI_RSDP_ADDR_OFFSET,
-            IntoBytes::as_bytes(&ACPI_RSDP_GPA),
+            zero_page_gpa + acpi_rsdp_addr_offset as u64,
+            IntoBytes::as_bytes(&acpi_rsdp_gpa),
         )
         .map_err(Error::WriteAcpi)?;
 
         tracing::info!(
-            ACPI_RSDP_GPA,
-            ACPI_TABLES_GPA,
+            acpi_rsdp_gpa,
+            acpi_tables_gpa,
             "wrote ACPI tables to guest memory for native IGVM"
         );
     }

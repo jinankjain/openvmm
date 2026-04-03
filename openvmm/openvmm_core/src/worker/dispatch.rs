@@ -2484,6 +2484,34 @@ impl LoadedVmInner {
                 let mut entropy = [0u8; ENTROPY_SIZE];
                 getrandom::fill(&mut entropy).unwrap();
 
+                // Build a DSDT for native IGVM guests using the actual
+                // chipset config and PCI device assignments.
+                #[cfg(guest_arch = "x86_64")]
+                let dsdt_bytes;
+                #[cfg(guest_arch = "x86_64")]
+                let dsdt_opt = if self.chipset_cfg.with_generic_pci_bus
+                    || self.chipset_cfg.with_i440bx_host_pci_bridge
+                {
+                    let mut dsdt = dsdt::Dsdt::new();
+                    if self.mem_layout.mmio().len() >= 2 {
+                        add_devices_to_dsdt(
+                            &self.mem_layout,
+                            &mut dsdt,
+                            &self.chipset_cfg,
+                            true, // serial_uarts
+                            self.virtio_mmio_count,
+                            self.virtio_mmio_irq,
+                            &self.pci_legacy_interrupts,
+                        );
+                    }
+                    dsdt_bytes = dsdt.to_bytes();
+                    Some(dsdt_bytes.as_slice())
+                } else {
+                    None
+                };
+                #[cfg(not(guest_arch = "x86_64"))]
+                let dsdt_opt = None;
+
                 let params = crate::worker::vm_loaders::igvm::LoadIgvmParams {
                     igvm_file: self.igvm_file.as_ref().expect("should be already read"),
                     gm: &self.gm,
@@ -2495,6 +2523,7 @@ impl LoadedVmInner {
                         srat: &srat,
                         slit: None,
                         pptt: None,
+                        dsdt: dsdt_opt,
                     },
                     vtl2_base_address,
                     vtl2_framebuffer_gpa_base: self.vtl2_framebuffer_gpa_base,
