@@ -553,6 +553,10 @@ pub struct AcpiTables<'a> {
     /// Pre-built DSDT for native IGVM guests. Built by the dispatch
     /// layer which knows the chipset config and PCI device assignments.
     pub dsdt: Option<&'a [u8]>,
+    /// Pre-built FADT for native IGVM guests (without x_dsdt set).
+    /// Built by the dispatch layer which knows the chipset type.
+    /// igvm.rs fills in x_dsdt at assembly time.
+    pub fadt: Option<acpi_spec::fadt::Fadt>,
 }
 
 /// The parameters to the [`load_igvm`] function.
@@ -857,6 +861,11 @@ fn load_igvm_x86(
     // Track the highest GPA used by IGVM parameter inserts so we can
     // place ACPI tables right after without hardcoding addresses.
     let mut max_parameter_end_gpa: u64 = 0;
+    // Track which parameter area indices correspond to ACPI tables
+    // so we can reference their GPAs directly from the XSDT instead
+    // of duplicating the table data.
+    let mut acpi_param_area_indices: HashMap<u32, &'static str> = HashMap::new();
+    let mut acpi_param_gpas: HashMap<&'static str, u64> = HashMap::new();
 
     // If requested, filter to VTL2-related directives only.
     let pt_range = page_table_fixup.as_ref().map_or(MemoryRange::EMPTY, |x| {
@@ -984,13 +993,16 @@ fn load_igvm_x86(
                 import_parameter(&mut parameter_areas, info, proc_count.as_bytes())?;
             }
             IgvmDirectiveHeader::Srat(ref info) => {
+                acpi_param_area_indices.insert(info.parameter_area_index, "srat");
                 import_parameter(&mut parameter_areas, info, acpi_tables.srat)?;
             }
             IgvmDirectiveHeader::Madt(ref info) => {
+                acpi_param_area_indices.insert(info.parameter_area_index, "madt");
                 import_parameter(&mut parameter_areas, info, acpi_tables.madt)?;
             }
             IgvmDirectiveHeader::Slit(ref info) => {
                 if let Some(slit) = acpi_tables.slit {
+                    acpi_param_area_indices.insert(info.parameter_area_index, "slit");
                     import_parameter(&mut parameter_areas, info, slit)?;
                 } else {
                     tracing::warn!("igvm file requested a SLIT, but no SLIT was provided")
@@ -998,6 +1010,7 @@ fn load_igvm_x86(
             }
             IgvmDirectiveHeader::Pptt(ref info) => {
                 if let Some(pptt) = acpi_tables.pptt {
+                    acpi_param_area_indices.insert(info.parameter_area_index, "pptt");
                     import_parameter(&mut parameter_areas, info, pptt)?;
                 } else {
                     tracing::warn!("igvm file requested a PPTT, but no PPTT was provided")
@@ -1219,6 +1232,13 @@ fn load_igvm_x86(
                     .expect("igvmfile should be valid");
                 match std::mem::replace(area, ParameterAreaState::Inserted) {
                     ParameterAreaState::Allocated { data, max_size } => {
+                        // Record GPA for ACPI parameter areas so the
+                        // XSDT can reference them directly.
+                        if let Some(name) = acpi_param_area_indices.get(&parameter_area_index) {
+                            acpi_param_gpas.insert(name, gpa);
+                        }
+                        // Track the highest GPA used by parameter inserts
+                        // so we can place ACPI tables after all parameters.
                         let end_gpa = gpa + max_size;
                         if end_gpa > max_parameter_end_gpa {
                             max_parameter_end_gpa = end_gpa;
@@ -1341,10 +1361,9 @@ fn load_igvm_x86(
             "wrote e820 entries to zero page for native IGVM"
         );
 
-        // Build ACPI tables (RSDP + XSDT + FADT + DSDT + MADT + SRAT)
-        // and write them to guest memory. Place them right after the
-        // last IGVM parameter area so addresses are determined
-        // dynamically from the IGVM file layout.
+        // Build ACPI tables (RSDP + XSDT + FADT + DSDT) and place them
+        // right after the last IGVM parameter area. The RSDP gets one page,
+        // and the remaining tables follow immediately after.
         let acpi_rsdp_gpa = (max_parameter_end_gpa + HV_PAGE_SIZE - 1) & !(HV_PAGE_SIZE - 1);
         let acpi_tables_gpa = acpi_rsdp_gpa + HV_PAGE_SIZE;
 
@@ -1370,30 +1389,25 @@ fn load_igvm_x86(
         };
         let dsdt_addr = builder.append_raw(dsdt_bytes);
 
-        builder.append(&acpi::builder::Table::new(
-            6,
-            None,
-            &acpi_spec::fadt::Fadt {
-                flags: acpi_spec::fadt::FADT_HW_REDUCED_ACPI,
-                x_dsdt: dsdt_addr,
-                p_lvl2_lat: 101,  // disable C2
-                p_lvl3_lat: 1001, // disable C3
-                ..Default::default()
-            },
-        ));
+        // Use the pre-built FADT from dispatch, filling in x_dsdt now
+        // that we know the DSDT GPA.
+        let mut fadt = acpi_tables.fadt.expect("FADT must be provided for native IGVM guests");
+        fadt.x_dsdt = dsdt_addr;
+        builder.append(&acpi::builder::Table::new(6, None, &fadt));
 
-        // Append the MADT (already a complete ACPI table with header).
-        builder.append_raw(acpi_tables.madt);
-
-        // Append the SRAT.
-        builder.append_raw(acpi_tables.srat);
-
-        // Append SLIT and PPTT if provided.
-        if let Some(slit) = acpi_tables.slit {
-            builder.append_raw(slit);
+        // Reference MADT/SRAT/SLIT/PPTT at their IGVM parameter area
+        // GPAs directly instead of duplicating the data.
+        if let Some(&gpa) = acpi_param_gpas.get("madt") {
+            builder.register_external_table(gpa);
         }
-        if let Some(pptt) = acpi_tables.pptt {
-            builder.append_raw(pptt);
+        if let Some(&gpa) = acpi_param_gpas.get("srat") {
+            builder.register_external_table(gpa);
+        }
+        if let Some(&gpa) = acpi_param_gpas.get("slit") {
+            builder.register_external_table(gpa);
+        }
+        if let Some(&gpa) = acpi_param_gpas.get("pptt") {
+            builder.register_external_table(gpa);
         }
 
         let (rsdp_bytes, tables_bytes) = builder.build();
